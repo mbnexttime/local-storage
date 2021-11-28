@@ -14,6 +14,9 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <utility>
+#include <fstream>
+#include <thread>
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -30,6 +33,152 @@ namespace {
 ////////////////////////////////////////////////////////////////////////////////
 
 constexpr int max_events = 32;
+
+const int SLEEP_TIME_MS = 1000;
+
+template<class K, class V>
+class FileWriteReadStrategy {
+    public:
+        virtual void writeToFile(const K& k, const V& v, std::ofstream& stream) = 0;
+        virtual std::pair<K, V> readFromFile(std::ifstream& stream) = 0;
+};
+
+template<>
+class FileWriteReadStrategy<std::string, uint64_t> {
+    public:
+        void writeToFile(const std::string& k, const uint64_t& v, std::ofstream& stream) {
+            stream << k << ' ' << v << ' ';
+        }
+
+        std::pair<std::string, uint64_t> readFromFile(std::ifstream& stream) {
+            std::string key;
+            uint64_t value;
+            stream >> key >> value;
+            return { key, value };
+        }
+};
+
+class ConcreteFileWriteReadStrategy: public FileWriteReadStrategy<std::string, uint64_t> {
+    public:
+        void writeToFile(std::string& k, uint64_t& v, std::ofstream& stream) {
+            stream << k << ' ' << v << ' ';
+        }
+
+        std::pair<std::string, uint64_t> readFromFile(std::ifstream& stream) {
+            std::string key;
+            uint64_t value;
+            stream >> key >> value;
+            return { key, value };
+        }
+};
+
+template<class K, class V>
+class PersistentHashTable {
+    public:
+        PersistentHashTable(
+            FileWriteReadStrategy<K, V> fileWriteReadStrategy,
+            std::string& logsPath_,
+            std::string& dbPath_
+        ): logsPath(logsPath_), dbPath(dbPath_)  {
+            fwrs = fileWriteReadStrategy;
+            logsPath = logsPath_;
+            dbPath = dbPath_;
+
+            auto dropper = [&] () {
+                while (true) {
+                    if (this->cancelThread) {
+                        return;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(SLEEP_TIME_MS));
+                    if (this->cancelThread) {
+                        return;
+                    }
+                    std::lock_guard<std::mutex> guard(this->dbMutex);
+                    if (this->cancelThread) {
+                        return;
+                    }
+                    this->dropTable();
+                }
+            };
+
+            dropThread = std::thread(dropper);
+
+            std::ifstream logsStream(logsPath);
+            std::ifstream dbStream(dbPath);
+            if (dbStream.good()) {
+                int cnt;
+                dbStream >> cnt;
+                for (int i = 0; i < cnt; i++) {
+                    auto pair = fwrs.readFromFile(dbStream);
+                    db[pair.first] = pair.second;
+                }
+            }
+
+            if (logsStream.good()) {
+                int cnt;
+                logsStream >> cnt;
+                for (int i = 0; i < cnt; i++) {
+                    auto pair = fwrs.readFromFile(logsStream);
+                    db[pair.first] = pair.second;
+                }
+            }
+        }
+
+        void put(const K& key, const V& value) {
+            std::lock_guard<std::mutex> guard(dbMutex);
+            pendingLog.push_back({ key, value });
+            db[key] = value;
+        }
+
+        V* get(const K& key) {
+            std::lock_guard<std::mutex> guard(dbMutex);
+            if (db.find(key) == db.end()) {
+                return NULL;
+            } else {
+                return &db[key];
+            }
+        }
+
+        void dropTable() {
+            std::ofstream logsStream(logsPath, std::ios_base::trunc);
+            std::ofstream dbStream(dbPath, std::ios_base::trunc);
+            pendingLog.clear();
+            dbStream << db.size() << ' ';
+            for (auto& entry: db) {
+                fwrs.writeToFile(entry.first, entry.second, dbStream);
+            }
+            dbStream.flush();
+            logsStream.close();
+            dbStream.close();
+        }
+
+        void dropLogs() {
+            std::ofstream logsStream(logsPath, std::ios_base::trunc);
+            logsStream << pendingLog.size() << ' ';
+            for (auto& entry: pendingLog) {
+                fwrs.writeToFile(entry.first, entry.second, logsStream);
+            }
+            pendingLog.clear();
+            logsStream.flush();
+            logsStream.close();
+        }
+
+        ~PersistentHashTable() {
+            cancelThread = true;
+            dropThread.join();
+            dropLogs();
+        }
+
+    private:
+        std::vector<std::pair<K, V>> pendingLog;
+        std::unordered_map<K, V> db;
+        FileWriteReadStrategy<K, V> fwrs;
+        std::string& logsPath;
+        std::string& dbPath;
+        std::mutex dbMutex;
+        std::thread dropThread;
+        bool cancelThread = false;
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -190,9 +339,10 @@ int main(int argc, const char** argv)
     /*
      * handler function
      */
-
-    // TODO on-disk storage
-    std::unordered_map<std::string, uint64_t> storage;
+    FileWriteReadStrategy<std::string, uint64_t> fwrs;
+    std::string logs = "logs.txt";
+    std::string db = "db.txt";
+    PersistentHashTable<std::string, uint64_t> st(fwrs, logs, db);
 
     auto handle_get = [&] (const std::string& request) {
         NProto::TGetRequest get_request;
@@ -206,9 +356,9 @@ int main(int argc, const char** argv)
 
         NProto::TGetResponse get_response;
         get_response.set_request_id(get_request.request_id());
-        auto it = storage.find(get_request.key());
-        if (it != storage.end()) {
-            get_response.set_offset(it->second);
+        uint64_t* it = st.get(get_request.key());
+        if (it != NULL) {
+            get_response.set_offset(*it);
         }
 
         std::stringstream response;
@@ -228,7 +378,7 @@ int main(int argc, const char** argv)
 
         LOG_DEBUG_S("put_request: " << put_request.ShortDebugString());
 
-        storage[put_request.key()] = put_request.offset();
+        st.put(put_request.key(), put_request.offset());
 
         NProto::TPutResponse put_response;
         put_response.set_request_id(put_request.request_id());
