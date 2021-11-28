@@ -58,20 +58,6 @@ class FileWriteReadStrategy<std::string, uint64_t> {
         }
 };
 
-class ConcreteFileWriteReadStrategy: public FileWriteReadStrategy<std::string, uint64_t> {
-    public:
-        void writeToFile(std::string& k, uint64_t& v, std::ofstream& stream) {
-            stream << k << ' ' << v << ' ';
-        }
-
-        std::pair<std::string, uint64_t> readFromFile(std::ifstream& stream) {
-            std::string key;
-            uint64_t value;
-            stream >> key >> value;
-            return { key, value };
-        }
-};
-
 template<class K, class V>
 class PersistentHashTable {
     public:
