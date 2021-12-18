@@ -444,6 +444,8 @@ int main(int argc, const char** argv)
                 }
             }
 
+            st.dropLogs();
+
             if (events[i].events & EPOLLOUT) {
                 auto state = states.at(fd);
                 if (!process_output(*state)) {
