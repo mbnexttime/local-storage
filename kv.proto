@@ -5,7 +5,7 @@ package NProto;
 message TPutRequest {
     uint64 request_id = 1;
     string key = 2;
-    uint64 offset = 3;
+    string offset = 3;
 }
 
 message TPutResponse {
@@ -19,5 +19,5 @@ message TGetRequest {
 
 message TGetResponse {
     uint64 request_id = 1;
-    uint64 offset = 2;
+    string offset = 2;
 }

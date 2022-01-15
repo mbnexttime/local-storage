@@ -34,7 +34,7 @@ namespace {
 
 constexpr int max_events = 32;
 
-const int SLEEP_TIME_MS = 1000;
+const int SLEEP_TIME_MS = 2000;
 
 template<class K, class V>
 class FileWriteReadStrategy {
@@ -79,10 +79,6 @@ class PersistentHashTable {
                     if (this->cancelThread) {
                         return;
                     }
-                    std::lock_guard<std::mutex> guard(this->dbMutex);
-                    if (this->cancelThread) {
-                        return;
-                    }
                     this->dropTable();
                 }
             };
@@ -113,11 +109,21 @@ class PersistentHashTable {
         void put(const K& key, const V& value) {
             std::lock_guard<std::mutex> guard(dbMutex);
             pendingLog.push_back({ key, value });
-            db[key] = value;
+            if (!dropping) {
+                db[key] = value;
+            }
         }
 
         V* get(const K& key) {
             std::lock_guard<std::mutex> guard(dbMutex);
+            if (pendingLog.size() > 0) {
+                for (int i = pendingLog.size() - 1; i >= 0; i--) {
+                    if (pendingLog[i].first == key) {
+                        return &pendingLog[i].second;
+                    }
+                }
+            }
+
             if (db.find(key) == db.end()) {
                 return NULL;
             } else {
@@ -126,16 +132,21 @@ class PersistentHashTable {
         }
 
         void dropTable() {
-            std::ofstream logsStream(logsPath, std::ios_base::trunc);
+            {
+                std::lock_guard<std::mutex> guard(dbMutex);
+                dropping = true;
+            }
             std::ofstream dbStream(dbPath, std::ios_base::trunc);
-            pendingLog.clear();
             dbStream << db.size() << ' ';
             for (auto& entry: db) {
                 fwrs.writeToFile(entry.first, entry.second, dbStream);
             }
             dbStream.flush();
-            logsStream.close();
             dbStream.close();
+            {
+                std::lock_guard<std::mutex> guard(dbMutex);
+                dropping = false;
+            }
         }
 
         void dropLogs() {
@@ -144,7 +155,15 @@ class PersistentHashTable {
             for (auto& entry: pendingLog) {
                 fwrs.writeToFile(entry.first, entry.second, logsStream);
             }
-            pendingLog.clear();
+            if (!dropping) {
+                std::lock_guard<std::mutex> guard(dbMutex);
+                if (!dropping) {
+                    for (auto& entry: pendingLog) {
+                        db[entry.first] = entry.second;
+                    }
+                    pendingLog.clear();
+                }
+            }
             logsStream.flush();
             logsStream.close();
         }
@@ -163,7 +182,44 @@ class PersistentHashTable {
         std::string& dbPath;
         std::mutex dbMutex;
         std::thread dropThread;
+        bool dropping = false;
         bool cancelThread = false;
+};
+
+class BinaryPersistentHashTable {
+    public:
+        BinaryPersistentHashTable(
+            std::string binary_file_path_,
+            PersistentHashTable<std::string, uint64_t>& table_
+        ): table(table_) {
+            f = fopen(binary_file_path_.c_str(), "ab+");
+        }
+
+        std::string get(const std::string& key) {
+            uint64_t* offset = table.get(key);
+            if (offset == NULL) {
+                return "";
+            }
+            fseek(f, *offset, SEEK_SET);
+            uint64_t sz;
+            fread(&sz, sizeof(uint64_t), 1, f);
+            std::string ret(sz, 0);
+            fread(&ret[0], sizeof(char), sz, f);
+            fseek(f, 0, SEEK_END);
+            return ret;
+        }
+
+        void put(const std::string& key, const std::string& value) {
+            uint64_t sz = value.size();
+            uint64_t offset = ftell(f);
+            fwrite(&sz, sizeof(uint64_t), 1, f);
+            fwrite(value.c_str(), sizeof(char), sz, f);
+            table.put(key, offset);
+        }
+
+    private:
+        PersistentHashTable<std::string, uint64_t>& table;
+        FILE* f;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -330,6 +386,9 @@ int main(int argc, const char** argv)
     std::string db = "db.txt";
     PersistentHashTable<std::string, uint64_t> st(fwrs, logs, db);
 
+    std::string binDb = "values.bin";
+    BinaryPersistentHashTable binaryDb(binDb, st);
+
     auto handle_get = [&] (const std::string& request) {
         NProto::TGetRequest get_request;
         if (!get_request.ParseFromArray(request.data(), request.size())) {
@@ -342,9 +401,9 @@ int main(int argc, const char** argv)
 
         NProto::TGetResponse get_response;
         get_response.set_request_id(get_request.request_id());
-        uint64_t* it = st.get(get_request.key());
-        if (it != NULL) {
-            get_response.set_offset(*it);
+        std::string it = binaryDb.get(get_request.key());
+        if (it != "") {
+            get_response.set_offset(it);
         }
 
         std::stringstream response;
@@ -364,7 +423,7 @@ int main(int argc, const char** argv)
 
         LOG_DEBUG_S("put_request: " << put_request.ShortDebugString());
 
-        st.put(put_request.key(), put_request.offset());
+        binaryDb.put(put_request.key(), put_request.offset());
 
         NProto::TPutResponse put_response;
         put_response.set_request_id(put_request.request_id());
