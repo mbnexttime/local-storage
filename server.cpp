@@ -150,19 +150,17 @@ class PersistentHashTable {
         }
 
         void dropLogs() {
+            std::lock_guard<std::mutex> guard(dbMutex);
             std::ofstream logsStream(logsPath, std::ios_base::trunc);
             logsStream << pendingLog.size() << ' ';
             for (auto& entry: pendingLog) {
                 fwrs.writeToFile(entry.first, entry.second, logsStream);
             }
             if (!dropping) {
-                std::lock_guard<std::mutex> guard(dbMutex);
-                if (!dropping) {
-                    for (auto& entry: pendingLog) {
-                        db[entry.first] = entry.second;
-                    }
-                    pendingLog.clear();
+                for (auto& entry: pendingLog) {
+                    db[entry.first] = entry.second;
                 }
+                pendingLog.clear();
             }
             logsStream.flush();
             logsStream.close();
