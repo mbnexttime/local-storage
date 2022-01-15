@@ -104,7 +104,11 @@ int main(int argc, const char** argv) {
      */
 
     auto generate_data = [] (int i) {
-        return i * 4;
+        std::string result = "";
+        for (int j = 0; j < 64; j++) {
+            result.push_back((char) (((i + j) % 27) + 'a'));
+        }
+        return result;
     };
 
     uint64_t request_count = 0;
@@ -127,7 +131,7 @@ int main(int argc, const char** argv) {
         }
     };
 
-    std::unordered_map<uint64_t, uint64_t> expected_gets;
+    std::unordered_map<uint64_t, std::string> expected_gets;
 
     auto stage_get = [&] () {
         for (int i = 0; i < max_requests; ++i) {

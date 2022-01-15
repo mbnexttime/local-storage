@@ -186,6 +186,42 @@ class PersistentHashTable {
         bool cancelThread = false;
 };
 
+class BinaryPersistentHashTable {
+    public:
+        BinaryPersistentHashTable(
+            std::string binary_file_path_,
+            PersistentHashTable<std::string, uint64_t>& table_
+        ): table(table_) {
+            f = fopen(binary_file_path_.c_str(), "ab+");
+        }
+
+        std::string get(const std::string& key) {
+            uint64_t* offset = table.get(key);
+            if (offset == NULL) {
+                return "";
+            }
+            fseek(f, *offset, SEEK_SET);
+            uint64_t sz;
+            fread(&sz, sizeof(uint64_t), 1, f);
+            std::string ret(sz, 0);
+            fread(&ret[0], sizeof(char), sz, f);
+            fseek(f, 0, SEEK_END);
+            return ret;
+        }
+
+        void put(const std::string& key, const std::string& value) {
+            uint64_t sz = value.size();
+            uint64_t offset = ftell(f);
+            fwrite(&sz, sizeof(uint64_t), 1, f);
+            fwrite(value.c_str(), sizeof(char), sz, f);
+            table.put(key, offset);
+        }
+
+    private:
+        PersistentHashTable<std::string, uint64_t>& table;
+        FILE* f;
+};
+
 ////////////////////////////////////////////////////////////////////////////////
 
 auto create_and_bind(std::string const& port)
@@ -350,6 +386,9 @@ int main(int argc, const char** argv)
     std::string db = "db.txt";
     PersistentHashTable<std::string, uint64_t> st(fwrs, logs, db);
 
+    std::string binDb = "values.bin";
+    BinaryPersistentHashTable binaryDb(binDb, st);
+
     auto handle_get = [&] (const std::string& request) {
         NProto::TGetRequest get_request;
         if (!get_request.ParseFromArray(request.data(), request.size())) {
@@ -362,9 +401,9 @@ int main(int argc, const char** argv)
 
         NProto::TGetResponse get_response;
         get_response.set_request_id(get_request.request_id());
-        uint64_t* it = st.get(get_request.key());
-        if (it != NULL) {
-            get_response.set_offset(*it);
+        std::string it = binaryDb.get(get_request.key());
+        if (it != "") {
+            get_response.set_offset(it);
         }
 
         std::stringstream response;
@@ -384,7 +423,7 @@ int main(int argc, const char** argv)
 
         LOG_DEBUG_S("put_request: " << put_request.ShortDebugString());
 
-        st.put(put_request.key(), put_request.offset());
+        binaryDb.put(put_request.key(), put_request.offset());
 
         NProto::TPutResponse put_response;
         put_response.set_request_id(put_request.request_id());
